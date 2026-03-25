@@ -14,7 +14,7 @@
 
 Environment requirements:
 
-- [go](https://go.dev/doc/install) version 1.22 or above
+- [go](https://go.dev/doc/install) version 1.24.1
 - cmake version 3.24 or above
 - C/C++ Compiler e.g. Clang on macOS, [TDM-GCC](https://github.com/jmeubank/tdm-gcc/releases) (Windows amd64) or [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) (Windows arm64), GCC/Clang on Linux.
 
@@ -23,7 +23,7 @@ Clone OpenBMB Ollama Fork:
 ```sh
 git clone https://github.com/tc-mb/ollama.git
 cd ollama
-git checkout MIniCPM-V
+git checkout Support-MiniCPM-o-4.5
 ```
 
 Then build and run Ollama from the root directory of the repository:
