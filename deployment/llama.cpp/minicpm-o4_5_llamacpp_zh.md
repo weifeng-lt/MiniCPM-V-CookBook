@@ -58,7 +58,7 @@ cd build/bin/
 ./llama-mtmd-cli -m ../MiniCPM-o-4_5/model/Model-8.2B-F16.gguf --mmproj ../MiniCPM-o-4_5/MiniCPM-o-4_5-vision-F16.gguf -c 4096 --temp 0.7 --top-p 0.8 --top-k 100 --repeat-penalty 1.05 --image xx.jpg -p "What is in the image?"
 
 # 运行 int4 量化版本
-./llama-mtmd-cli -m ../MiniCPM-o-4_5/model/MiniCPM-o-4_5-Q4_K_M.gguf --mmproj ../MiniCPM-o-4_5/MiniCPM-o-4_5-vision-F16.gguf -c 4096 --temp 0.7 --top-p 0.8 --top-k 100 --repeat-penalty 1.05 --image xx.jpg -p "What is in the image?"
+./llama-mtmd-cli -m /root/workspace/models/OpenBMB/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf --mmproj /root/workspace/models/OpenBMB/MiniCPM-o-4_5-gguf/vision/MiniCPM-o-4_5-vision-F16.gguf -c 4096 --temp 0.7 --top-p 0.8 --top-k 100 --repeat-penalty 1.05 --image /root/workspace/models/test-640x360.png -p "What is in the image?"
 
 # 或以交互模式运行
 ./llama-mtmd-cli -m ../MiniCPM-o-4_5/model/MiniCPM-o-4_5-Q4_K_M.gguf --mmproj ../MiniCPM-o-4_5/MiniCPM-o-4_5-vision-F16.gguf -c 4096 --temp 0.7 --top-p 0.8 --top-k 100 --repeat-penalty 1.05 --image xx.jpg -i

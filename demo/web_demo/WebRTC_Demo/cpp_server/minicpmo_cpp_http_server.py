@@ -144,6 +144,10 @@ pending_prefill_data: Optional[dict] = None
 is_breaking: bool = False  # break 标志：为 True 时中间层停止向前端发送数据
 health_server_thread: Optional[threading.Thread] = None
 
+# 🔧 [System Prompt 缓存] 用于极速恢复时判断是否需要重新 prefill
+current_system_prompt_prefix: Optional[str] = None
+current_system_prompt_suffix: Optional[str] = None
+
 # 🔧 [高刷模式] 子图缓存：按 image_audio_id 分组存储（frame_index 1-4 的子图）
 # key: image_audio_id, value: {frame_index: PIL.Image}
 # 注意：主图（frame_index=0）立即处理，不缓存
@@ -882,10 +886,13 @@ class InitSysPromptRequest(BaseModel):
     high_quality_mode: Optional[bool] = False  # 🔧 [高清模式] 启用图片切片 (max_slice_nums=2)
     high_fps_mode: Optional[bool] = False  # 🔧 [高刷模式] 1秒5帧 stack
     language: Optional[str] = "zh"  # 🔧 [语言切换] "zh" 中文, "en" 英文
+    system_prompt_prefix: Optional[str] = None  # 🔧 [自定义系统提示词前缀] 插入在参考音频之前
+    system_prompt_suffix: Optional[str] = None  # 🔧 [自定义系统提示词后缀] 插入在参考音频之后
 
 class StreamingPrefillRequest(BaseModel):
     audio: Optional[str] = None  # base64编码的音频
     image: Optional[str] = None  # base64编码的图片
+    text: Optional[str] = None  # 🔧 [文本输入] 用户文本输入（支持半双工模式下的文字输入）
     # 🔧 [高刷模式] 图片按 image_audio_id 分组
     image_audio_id: Optional[int] = None  # 图片音频关联ID（用于标记同一组音频和图片）
     frame_index: Optional[int] = None  # 当前帧索引 (0=主图, 1-4=子图用于stack)
@@ -1136,7 +1143,15 @@ async def init_sys_prompt(request: InitSysPromptRequest):
             if os.path.exists(FIXED_TIMBRE_PATH):
                 cpp_request["voice_audio"] = FIXED_TIMBRE_PATH
                 print(f"使用音色文件: {FIXED_TIMBRE_PATH}", flush=True)
-            
+
+            # 🔧 [自定义系统提示词] 如果提供，传递给 C++
+            if request.system_prompt_prefix:
+                cpp_request["system_prompt_prefix"] = request.system_prompt_prefix
+                print(f"[自定义系统提示词前缀] {request.system_prompt_prefix}", flush=True)
+            if request.system_prompt_suffix:
+                cpp_request["system_prompt_suffix"] = request.system_prompt_suffix
+                print(f"[自定义系统提示词后缀] {request.system_prompt_suffix}", flush=True)
+
             print(f"初始化，调用 C++ omni_init: {json.dumps(cpp_request, ensure_ascii=False)}", flush=True)
             
             resp = await http_client.post(
@@ -1152,6 +1167,13 @@ async def init_sys_prompt(request: InitSysPromptRequest):
             cpp_result = resp.json()
             print(f"C++ omni_init 成功: {cpp_result}", flush=True)
             model_state_initialized = True
+
+            # 🔧 [System Prompt 缓存] 保存当前 system prompt 用于后续比较
+            global current_system_prompt_prefix, current_system_prompt_suffix
+            current_system_prompt_prefix = request.system_prompt_prefix
+            current_system_prompt_suffix = request.system_prompt_suffix
+            print(f"[System Prompt 缓存] prefix={current_system_prompt_prefix is not None}, suffix={current_system_prompt_suffix is not None}", flush=True)
+
             fast_resume = False
             init_message = f"初始化完成（{mode_name}模式，{duplex_name}，{quality_name}画质，{fps_name}）"
         elif media_type_changed:
@@ -1164,11 +1186,19 @@ async def init_sys_prompt(request: InitSysPromptRequest):
                 "duplex_mode": duplex_mode,
                 "language": language,  # 🔧 [语言切换]
             }
-            
+
             # 使用固定音色文件重新 prefill system prompt
             if os.path.exists(FIXED_TIMBRE_PATH):
                 update_request["voice_audio"] = FIXED_TIMBRE_PATH
-            
+
+            # 🔧 [自定义系统提示词] 如果提供，传递给 C++
+            if request.system_prompt_prefix:
+                update_request["system_prompt_prefix"] = request.system_prompt_prefix
+                print(f"[自定义系统提示词前缀] {request.system_prompt_prefix}", flush=True)
+            if request.system_prompt_suffix:
+                update_request["system_prompt_suffix"] = request.system_prompt_suffix
+                print(f"[自定义系统提示词后缀] {request.system_prompt_suffix}", flush=True)
+
             print(f"[模式切换] 调用 C++ update_session_config: {json.dumps(update_request, ensure_ascii=False)}", flush=True)
             
             resp = await http_client.post(
@@ -1185,42 +1215,111 @@ async def init_sys_prompt(request: InitSysPromptRequest):
             cpp_result = resp.json()
             print(f"C++ update_session_config 成功: {cpp_result}", flush=True)
             fast_resume = False
+
+            # 🔧 [System Prompt 缓存] 更新缓存
+            current_system_prompt_prefix = request.system_prompt_prefix
+            current_system_prompt_suffix = request.system_prompt_suffix
+
             init_message = f"模式切换完成（{mode_name}模式，{duplex_name}，{quality_name}画质，{fps_name}）"
         else:
             # 已初始化且模式未变，但仍需通知 C++ 重置状态
-            # 🔧 [修复] 调用 update_session_config 确保 C++ 端状态正确重置
-            # 原因：TTS 线程可能还有残留状态，需要等待其完成并清理队列
             current_high_quality_mode = high_quality_mode
             current_high_fps_mode = high_fps_mode
-            
-            update_request = {
-                "media_type": msg_type,
-                "duplex_mode": duplex_mode,
-                "language": language,  # 🔧 [语言切换]
-            }
-            
-            # 使用固定音色文件重新 prefill system prompt
-            if os.path.exists(FIXED_TIMBRE_PATH):
-                update_request["voice_audio"] = FIXED_TIMBRE_PATH
-            
-            print(f"[极速恢复] 调用 C++ update_session_config 重置状态: {json.dumps(update_request, ensure_ascii=False)}", flush=True)
-            
-            resp = await http_client.post(
-                f"{CPP_SERVER_URL}/v1/stream/update_session_config",
-                json=update_request,
-                timeout=30.0
+
+            # 🔧 [极速恢复优化] 检查 system prompt 是否变化
+            system_prompt_changed = (
+                request.system_prompt_prefix != current_system_prompt_prefix or
+                request.system_prompt_suffix != current_system_prompt_suffix
             )
-            
-            if resp.status_code != 200:
-                error_text = resp.text
-                print(f"[极速恢复] C++ update_session_config 失败: {error_text}", flush=True)
-                raise HTTPException(status_code=500, detail=f"C++ update_session_config 失败: {error_text}")
-            
-            cpp_result = resp.json()
-            print(f"[极速恢复] C++ update_session_config 成功: {cpp_result}", flush=True)
+
+            if system_prompt_changed:
+                # System prompt 变化，需要重新 prefill
+                print(f"[极速恢复] System prompt 变化，需要重新 prefill", flush=True)
+                print(f"  原 prefix: {current_system_prompt_prefix}", flush=True)
+                print(f"  新 prefix: {request.system_prompt_prefix}", flush=True)
+                print(f"  原 suffix: {current_system_prompt_suffix}", flush=True)
+                print(f"  新 suffix: {request.system_prompt_suffix}", flush=True)
+
+                update_request = {
+                    "media_type": msg_type,
+                    "duplex_mode": duplex_mode,
+                    "language": language,
+                }
+
+                if os.path.exists(FIXED_TIMBRE_PATH):
+                    update_request["voice_audio"] = FIXED_TIMBRE_PATH
+
+                if request.system_prompt_prefix:
+                    update_request["system_prompt_prefix"] = request.system_prompt_prefix
+                if request.system_prompt_suffix:
+                    update_request["system_prompt_suffix"] = request.system_prompt_suffix
+
+                print(f"[极速恢复] 调用 C++ update_session_config: {json.dumps(update_request, ensure_ascii=False)}", flush=True)
+
+                resp = await http_client.post(
+                    f"{CPP_SERVER_URL}/v1/stream/update_session_config",
+                    json=update_request,
+                    timeout=30.0
+                )
+
+                if resp.status_code != 200:
+                    error_text = resp.text
+                    print(f"[极速恢复] C++ update_session_config 失败: {error_text}", flush=True)
+                    raise HTTPException(status_code=500, detail=f"C++ update_session_config 失败: {error_text}")
+
+                cpp_result = resp.json()
+                print(f"[极速恢复] C++ update_session_config 成功: {cpp_result}", flush=True)
+            else:
+                # System prompt 未变化，使用轻量级 reset API
+                print(f"[极速恢复] System prompt 未变化，使用轻量级 reset", flush=True)
+
+                reset_request = {
+                    "duplex_mode": duplex_mode,
+                }
+
+                print(f"[极速恢复] 调用 C++ reset: {json.dumps(reset_request, ensure_ascii=False)}", flush=True)
+
+                resp = await http_client.post(
+                    f"{CPP_SERVER_URL}/v1/stream/reset",
+                    json=reset_request,
+                    timeout=10.0
+                )
+
+                if resp.status_code != 200:
+                    error_text = resp.text
+                    print(f"[极速恢复] C++ reset 失败: {error_text}", flush=True)
+                    # reset 失败回退到 update_session_config
+                    print(f"[极速恢复] 回退到 update_session_config", flush=True)
+
+                    update_request = {
+                        "media_type": msg_type,
+                        "duplex_mode": duplex_mode,
+                        "language": language,
+                    }
+                    if os.path.exists(FIXED_TIMBRE_PATH):
+                        update_request["voice_audio"] = FIXED_TIMBRE_PATH
+
+                    resp = await http_client.post(
+                        f"{CPP_SERVER_URL}/v1/stream/update_session_config",
+                        json=update_request,
+                        timeout=30.0
+                    )
+                    if resp.status_code != 200:
+                        raise HTTPException(status_code=500, detail=f"C++ fallback 失败: {resp.text}")
+                    cpp_result = resp.json()
+                    print(f"[极速恢复] C++ update_session_config 成功: {cpp_result}", flush=True)
+                else:
+                    cpp_result = resp.json()
+                    print(f"[极速恢复] C++ reset 成功: {cpp_result}", flush=True)
+
             fast_resume = True
+
+            # 🔧 [System Prompt 缓存] 更新缓存
+            current_system_prompt_prefix = request.system_prompt_prefix
+            current_system_prompt_suffix = request.system_prompt_suffix
+
             init_message = f"初始化成功（{mode_name}模式，{duplex_name}，{quality_name}画质，{fps_name}，快速恢复）"
-        
+
         # 关闭之前的日志文件（如果有）
         if wav_timing_log_file:
             try:
@@ -1443,8 +1542,8 @@ async def streaming_prefill(request: StreamingPrefillRequest):
         if current_duplex_mode:
             # ========== 双工模式：直接转发给 C++ ==========
             return await _streaming_prefill_duplex(
-                request, audio_np, pil_images, sr, audio_duration, 
-                omni_mode, timing_stats, prefill_start_time
+                request, audio_np, pil_images, sr, audio_duration,
+                omni_mode, timing_stats, prefill_start_time, request.text
             )
         elif current_high_fps_mode and current_msg_type == 2:
             # ========== 高刷单工模式：直接 prefill，不延迟 ==========
@@ -1454,13 +1553,14 @@ async def streaming_prefill(request: StreamingPrefillRequest):
             return await _streaming_prefill_highfps_direct(
                 request, audio_np, pil_images, sr, audio_duration,
                 omni_mode, timing_stats, prefill_start_time,
-                is_main_image=is_main_image  # 🔧 [高清+高刷] 传入主图标记
+                is_main_image=is_main_image,  # 🔧 [高清+高刷] 传入主图标记
+                user_text=request.text  # 🔧 [文本输入] 传入用户文本
             )
         else:
             # ========== 普通单工模式：使用"延迟一拍"机制 ==========
             return await _streaming_prefill_simplex(
                 request, audio_np, pil_images, sr, audio_duration,
-                omni_mode, timing_stats, prefill_start_time
+                omni_mode, timing_stats, prefill_start_time, request.text
             )
         
     except HTTPException:
@@ -1472,8 +1572,8 @@ async def streaming_prefill(request: StreamingPrefillRequest):
 
 
 async def _streaming_prefill_duplex(
-    request, audio_np, pil_images, sr, audio_duration, 
-    omni_mode, timing_stats, prefill_start_time
+    request, audio_np, pil_images, sr, audio_duration,
+    omni_mode, timing_stats, prefill_start_time, user_text=None
 ):
     """双工模式的 streaming_prefill 实现：直接转发给 C++"""
     global current_request_counter
@@ -1536,7 +1636,8 @@ async def _streaming_prefill_duplex(
         cpp_request = {
             "audio_path_prefix": temp_audio_path,
             "img_path_prefix": "",
-            "cnt": cnt
+            "cnt": cnt,
+            "user_text": user_text if user_text else ""
         }
         resp = await http_client.post(
             f"{CPP_SERVER_URL}/v1/stream/prefill",
@@ -1550,7 +1651,8 @@ async def _streaming_prefill_duplex(
             cpp_request = {
                 "audio_path_prefix": temp_audio_path if i == 0 else "",
                 "img_path_prefix": img_path,
-                "cnt": cnt + i
+                "cnt": cnt + i,
+                "user_text": user_text if (i == 0 and user_text) else ""
             }
             resp = await http_client.post(
                 f"{CPP_SERVER_URL}/v1/stream/prefill",
@@ -1601,7 +1703,8 @@ async def _streaming_prefill_duplex(
 async def _streaming_prefill_highfps_direct(
     request, audio_np, pil_images, sr, audio_duration,
     omni_mode, timing_stats, prefill_start_time,
-    is_main_image: bool = False  # 🔧 [高清+高刷] 标记是否为主图（决定是否使用高清切片）
+    is_main_image: bool = False,  # 🔧 [高清+高刷] 标记是否为主图（决定是否使用高清切片）
+    user_text=None  # 🔧 [文本输入] 用户文本输入
 ):
     """高刷单工模式的 streaming_prefill 实现：直接 prefill，不延迟
     
@@ -1662,7 +1765,8 @@ async def _streaming_prefill_highfps_direct(
         cpp_request = {
             "audio_path_prefix": temp_audio_path,
             "img_path_prefix": "",
-            "cnt": cnt
+            "cnt": cnt,
+            "user_text": user_text if user_text else ""
         }
         resp = await http_client.post(
             f"{CPP_SERVER_URL}/v1/stream/prefill",
@@ -1677,7 +1781,8 @@ async def _streaming_prefill_highfps_direct(
                 "audio_path_prefix": temp_audio_path if i == 0 else "",
                 "img_path_prefix": img_path,
                 "cnt": cnt + i,
-                "max_slice_nums": slice_nums  # 🔧 [高清+高刷] 传入切片参数
+                "max_slice_nums": slice_nums,  # 🔧 [高清+高刷] 传入切片参数
+                "user_text": user_text if (i == 0 and user_text) else ""
             }
             resp = await http_client.post(
                 f"{CPP_SERVER_URL}/v1/stream/prefill",
@@ -1729,7 +1834,7 @@ async def _streaming_prefill_highfps_direct(
 
 async def _streaming_prefill_simplex(
     request, audio_np, pil_images, sr, audio_duration,
-    omni_mode, timing_stats, prefill_start_time
+    omni_mode, timing_stats, prefill_start_time, user_text=None
 ):
     """普通单工模式的 streaming_prefill 实现：使用"延迟一拍"机制"""
     global pending_prefill_data, current_request_counter
@@ -1782,12 +1887,16 @@ async def _streaming_prefill_simplex(
                         img.save(img_path, format='PNG')
                         temp_image_paths.append(img_path)
             
+            # 🔧 [文本输入] 获取上一次缓存的用户文本（确保是字符串，不是 None）
+            prev_user_text = prev_data.get("user_text") or ""
+
             # 调用 C++ prefill
             if len(temp_image_paths) == 0:
                 cpp_request = {
                     "audio_path_prefix": temp_audio_path,
                     "img_path_prefix": "",
-                    "cnt": prev_cnt
+                    "cnt": prev_cnt,
+                    "user_text": prev_user_text
                 }
                 await http_client.post(f"{CPP_SERVER_URL}/v1/stream/prefill", json=cpp_request)
             else:
@@ -1795,7 +1904,8 @@ async def _streaming_prefill_simplex(
                     cpp_request = {
                         "audio_path_prefix": temp_audio_path if i == 0 else "",
                         "img_path_prefix": img_path,
-                        "cnt": prev_cnt + i
+                        "cnt": prev_cnt + i,
+                        "user_text": prev_user_text if i == 0 else ""
                     }
                     await http_client.post(f"{CPP_SERVER_URL}/v1/stream/prefill", json=cpp_request)
             
@@ -1814,6 +1924,7 @@ async def _streaming_prefill_simplex(
         "audio_duration": audio_duration,
         "request_idx": request_idx,
         "cnt": current_cnt,
+        "user_text": user_text or "",  # 🔧 [文本输入] 缓存用户文本（确保不是 None）
     }
     num_imgs = len(pil_images)
     print(f"[延迟一拍] 当前数据已缓存 (音频: {audio_duration:.2f}s, 图片: {num_imgs}张, cnt={current_cnt}) [单工]", flush=True)
@@ -1906,12 +2017,15 @@ async def _streaming_generate_simplex(generate_request_time):
                     temp_image_path = os.path.join(TEMP_DIR, f"prefill_{current_active_session_id}_{last_cnt}.png")
                     images[0].save(temp_image_path, format='PNG')
                 
+                # 🔧 [文本输入] 获取缓存的用户文本（确保是字符串，不是 None）
+                user_text = last_data.get("user_text") or ""
                 cpp_request = {
                     "audio_path_prefix": temp_audio_path,
                     "img_path_prefix": temp_image_path,
-                    "cnt": last_cnt
+                    "cnt": last_cnt,
+                    "user_text": user_text
                 }
-                
+
                 resp = await http_client.post(
                     f"{CPP_SERVER_URL}/v1/stream/prefill",
                     json=cpp_request
